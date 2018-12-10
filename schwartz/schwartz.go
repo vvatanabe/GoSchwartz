@@ -1,9 +1,27 @@
 package schwartz
 
-import "time"
+import (
+	"database/sql"
+	"log"
+	"time"
+)
+
+const (
+	RetryDefault     = 30
+	FindJobBatchSize = 50
+)
+
+func NewSchwartz(db *sql.DB) *Schwartz {
+	var schwartz *Schwartz
+	schwartz.DB = db
+	schwartz.RetrySeconds = RetryDefault
+	schwartz.BatchSize = FindJobBatchSize
+	// TODO implements
+	return schwartz
+}
 
 type Schwartz struct {
-	Databases             *Databases
+	DB                    *sql.DB
 	Verbose               bool
 	Prioritize            int
 	Floor                 int
@@ -11,17 +29,33 @@ type Schwartz struct {
 	DriverCacheExpiration time.Duration
 	RetrySeconds          time.Duration
 	StrictRemoveAbility   bool
+
+	funcmapCache *funcmapCache
 }
 
-type Databases struct {
-	DSN    string
-	User   string
-	Pass   string
-	Driver string
+type funcmapCache struct {
+	funcname2id map[string]int64
+	funcid2name map[int64]string
 }
 
 type Job struct {
-	// TODO implements
+	JobID        int64
+	FuncID       int64
+	FuncName     string
+	Arg          []byte
+	UniqKey      string
+	InsertTime   time.Time
+	RunAfter     time.Time
+	GrabbedUntil time.Time
+	Priority     int
+	Coalesce     string
+}
+
+func (s *Schwartz) isDatabaseDead() bool {
+	if err := s.DB.Ping(); err != nil {
+		return true
+	}
+	return false
 }
 
 func (s *Schwartz) ListJobs(
@@ -38,8 +72,64 @@ func (s *Schwartz) ListJobs(
 }
 
 func (s *Schwartz) LookupJob(jobID int) *Job {
-	// TODO implements
-	return nil
+	stmt := `
+SELECT
+	jobid, funcid, arg, uniqkey, insert_time, run_after, grabbed_until, priority, coalesce
+FROM
+  job
+WHERE
+  jobid = ?
+`
+	var job Job
+	err := s.DB.QueryRow(stmt, jobID).Scan(job, &job.JobID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
+		&job.RunAfter, &job.GrabbedUntil, &job.Priority, &job.Coalesce)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		} else {
+			return nil
+		}
+	}
+
+	job.FuncName = s.funcIDToName(job.FuncID)
+	return &job
+}
+
+func (s *Schwartz) funcIDToName(funcID int64) string {
+	return s.funcmapCache.funcid2name[funcID]
+
+}
+
+func (s *Schwartz) funcMapCache() {
+	if s.funcmapCache == nil {
+		s.funcmapCache = &funcmapCache{
+			funcid2name: make(map[int64]string),
+			funcname2id: make(map[string]int64),
+		}
+		stmt := `
+SELECT
+	funcid, funcname
+FROM
+	funcmap
+`
+		rows, err := s.DB.Query(stmt)
+		if err != nil {
+			// TODO error handling
+			log.Fatalln(err.Error())
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var funcid int64
+			var funcname string
+			if err := rows.Scan(&funcid, &funcname); err != nil {
+				log.Fatal(err)
+			}
+			s.funcmapCache.funcid2name[funcid] = funcname
+			s.funcmapCache.funcname2id[funcname] = funcid
+		}
+	}
+
 }
 
 func (s *Schwartz) SetVerbose(verbose bool) {
