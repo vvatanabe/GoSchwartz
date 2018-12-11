@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"log"
 	"time"
+
+	"github.com/vvatanabe/GoSchwartz/schwartz/jobhandle"
 )
 
 const (
@@ -34,13 +36,13 @@ type Schwartz struct {
 }
 
 type funcmapCache struct {
-	funcname2id map[string]int64
-	funcid2name map[int64]string
+	funcname2id map[string]int
+	funcid2name map[int]string
 }
 
 type Job struct {
-	JobID        int64
-	FuncID       int64
+	JobID        int
+	FuncID       int
 	FuncName     string
 	Arg          []byte
 	UniqKey      string
@@ -49,6 +51,8 @@ type Job struct {
 	GrabbedUntil time.Time
 	Priority     int
 	Coalesce     string
+
+	Handle *jobhandle.JobHandle
 }
 
 func (s *Schwartz) isDatabaseDead() bool {
@@ -91,11 +95,16 @@ WHERE
 		}
 	}
 
+	job.Handle = handleFromString(jobID)
 	job.FuncName = s.funcIDToName(job.FuncID)
 	return &job
 }
 
-func (s *Schwartz) funcIDToName(funcID int64) string {
+func handleFromString(jobID int) *jobhandle.JobHandle {
+	return jobhandle.NewFromString(jobID)
+}
+
+func (s *Schwartz) funcIDToName(funcID int) string {
 	return s.funcmapCache.funcid2name[funcID]
 
 }
@@ -103,8 +112,8 @@ func (s *Schwartz) funcIDToName(funcID int64) string {
 func (s *Schwartz) funcMapCache() {
 	if s.funcmapCache == nil {
 		s.funcmapCache = &funcmapCache{
-			funcid2name: make(map[int64]string),
-			funcname2id: make(map[string]int64),
+			funcid2name: make(map[int]string),
+			funcname2id: make(map[string]int),
 		}
 		stmt := `
 SELECT
@@ -120,7 +129,7 @@ FROM
 		defer rows.Close()
 
 		for rows.Next() {
-			var funcid int64
+			var funcid int
 			var funcname string
 			if err := rows.Scan(&funcid, &funcname); err != nil {
 				log.Fatal(err)
