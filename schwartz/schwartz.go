@@ -2,10 +2,9 @@ package schwartz
 
 import (
 	"database/sql"
+	"errors"
 	"log"
 	"time"
-
-	"github.com/vvatanabe/GoSchwartz/schwartz/jobhandle"
 )
 
 const (
@@ -13,17 +12,20 @@ const (
 	FindJobBatchSize = 50
 )
 
-func NewSchwartz(db *sql.DB) *Schwartz {
+func NewSchwartz(databases Databases) *Schwartz {
 	var schwartz *Schwartz
-	schwartz.DB = db
+	schwartz.Databases = databases
 	schwartz.RetrySeconds = RetryDefault
 	schwartz.BatchSize = FindJobBatchSize
 	// TODO implements
 	return schwartz
 }
 
+type DatabaseName = string
+type Databases = map[DatabaseName]*sql.DB
+
 type Schwartz struct {
-	DB                    *sql.DB
+	Databases             Databases
 	Verbose               bool
 	Prioritize            int
 	Floor                 int
@@ -32,10 +34,10 @@ type Schwartz struct {
 	RetrySeconds          time.Duration
 	StrictRemoveAbility   bool
 
-	funcmapCache *funcmapCache
+	funcmapCache map[string]*cache
 }
 
-type funcmapCache struct {
+type cache struct {
 	funcname2id map[string]int
 	funcid2name map[int]string
 }
@@ -52,14 +54,33 @@ type Job struct {
 	Priority     int
 	Coalesce     string
 
-	Handle *jobhandle.JobHandle
+	Handle *JobHandle
 }
 
-func (s *Schwartz) isDatabaseDead() bool {
-	if err := s.DB.Ping(); err != nil {
+func (s *Schwartz) isDatabaseDead(name DatabaseName) bool {
+	db, ok := s.Databases[name]
+	if !ok {
+		return false
+	}
+	if err := db.Ping(); err != nil {
 		return true
 	}
 	return false
+}
+
+type terms struct {
+	runAfter *struct {
+		OP    string
+		Value time.Duration
+	}
+	grabbedUntil *struct {
+		OP    string
+		Value time.Duration
+	}
+	jobid *struct {
+		OP    string
+		Value int
+	}
 }
 
 func (s *Schwartz) ListJobs(
@@ -72,10 +93,17 @@ func (s *Schwartz) ListJobs(
 	jobID int) []*Job {
 	var jobs []*Job
 	// TODO implements
+	var terms *terms
 	return jobs
 }
 
-func (s *Schwartz) LookupJob(jobID int) *Job {
+var ErrNotFoundDB = errors.New("schwartz: Not found DB")
+
+func (s *Schwartz) LookupJob(name DatabaseName, jobID int) (*Job, error) {
+	db := s.findDB(name)
+	if db == nil {
+		return nil, ErrNotFoundDB
+	}
 	stmt := `
 SELECT
 	jobid, funcid, arg, uniqkey, insert_time, run_after, grabbed_until, priority, coalesce
@@ -85,33 +113,36 @@ WHERE
   jobid = ?
 `
 	var job Job
-	err := s.DB.QueryRow(stmt, jobID).Scan(job, &job.JobID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
+	err := db.QueryRow(stmt, jobID).Scan(job, &job.JobID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
 		&job.RunAfter, &job.GrabbedUntil, &job.Priority, &job.Coalesce)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil
-		} else {
-			return nil
+			return nil, nil
 		}
+		return nil, err
 	}
-
-	job.Handle = handleFromString(jobID)
+	job.Handle = &JobHandle{name, jobID, s}
 	job.FuncName = s.funcIDToName(job.FuncID)
-	return &job
+	return &job, nil
 }
 
-func handleFromString(jobID int) *jobhandle.JobHandle {
-	return jobhandle.NewFromString(jobID)
+func (s *Schwartz) findDB(name DatabaseName) *sql.DB {
+	db, ok := s.Databases[name]
+	if !ok {
+		return nil
+	}
+	return db
 }
 
-func (s *Schwartz) funcIDToName(funcID int) string {
-	return s.funcmapCache.funcid2name[funcID]
+func (s *Schwartz) funcIDToName(name DatabaseName, funcID int) string {
+	cache := s.funcMapCache(name)
+	return cache[funcID]
 
 }
 
-func (s *Schwartz) funcMapCache() {
-	if s.funcmapCache == nil {
-		s.funcmapCache = &funcmapCache{
+func (s *Schwartz) funcMapCache(name string) *cache {
+	if cache, ok := s.funcmapCache[name]; !ok {
+		cache = &cache{
 			funcid2name: make(map[int]string),
 			funcname2id: make(map[string]int),
 		}
