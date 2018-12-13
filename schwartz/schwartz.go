@@ -35,6 +35,8 @@ type Schwartz struct {
 	StrictRemoveAbility   bool
 
 	funcmapCache map[string]*cache
+
+	allAbilities []interface{}
 }
 
 type cache struct {
@@ -69,18 +71,24 @@ func (s *Schwartz) isDatabaseDead(name DatabaseName) bool {
 }
 
 type terms struct {
-	runAfter *struct {
-		OP    string
-		Value time.Duration
-	}
-	grabbedUntil *struct {
-		OP    string
-		Value time.Duration
-	}
-	jobid *struct {
-		OP    string
-		Value int
-	}
+	runAfter     *runAfterTerm
+	grabbedUntil *grabbedUntilTerm
+	jobid        *jobIDTerm
+}
+
+type runAfterTerm struct {
+	OP    string
+	Value time.Duration
+}
+
+type grabbedUntilTerm struct {
+	OP    string
+	Value time.Duration
+}
+
+type jobIDTerm struct {
+	OP    string
+	Value int
 }
 
 func (s *Schwartz) ListJobs(
@@ -136,15 +144,21 @@ func (s *Schwartz) findDB(name DatabaseName) *sql.DB {
 
 func (s *Schwartz) funcIDToName(name DatabaseName, funcID int) string {
 	cache := s.funcMapCache(name)
-	return cache[funcID]
+	return cache.funcid2name[funcID]
 
 }
 
-func (s *Schwartz) funcMapCache(name string) *cache {
-	if cache, ok := s.funcmapCache[name]; !ok {
-		cache = &cache{
+func (s *Schwartz) funcMapCache(name DatabaseName) *cache {
+	c, ok := s.funcmapCache[name]
+	if !ok {
+		c = &cache{
 			funcid2name: make(map[int]string),
 			funcname2id: make(map[string]int),
+		}
+		db := s.findDB(name)
+		if db == nil {
+			// TODO error handling
+			return nil
 		}
 		stmt := `
 SELECT
@@ -152,29 +166,33 @@ SELECT
 FROM
 	funcmap
 `
-		rows, err := s.DB.Query(stmt)
+		rows, err := db.Query(stmt)
 		if err != nil {
 			// TODO error handling
-			log.Fatalln(err.Error())
+			return nil
 		}
 		defer rows.Close()
-
 		for rows.Next() {
 			var funcid int
 			var funcname string
 			if err := rows.Scan(&funcid, &funcname); err != nil {
 				log.Fatal(err)
 			}
-			s.funcmapCache.funcid2name[funcid] = funcname
-			s.funcmapCache.funcname2id[funcname] = funcid
+			c.funcid2name[funcid] = funcname
+			c.funcname2id[funcname] = funcid
 		}
+		s.funcmapCache[name] = c
 	}
-
+	return c
 }
 
 func (s *Schwartz) SetVerbose(verbose bool) {
 	// TODO implements
 	s.Verbose = verbose
+}
+
+func canDo(t interface{}) {
+
 }
 
 // --------------------
@@ -240,6 +258,17 @@ func (s *Schwartz) Work(delay *time.Duration) error {
 		*delay = time.Duration(5 * time.Second)
 	}
 	// TODO implements
+
+	jobs := make(chan *Job)
+
+	for job := range jobs {
+		go func(job *Job) {
+			trackJob(job)
+			workers[job.FuncName].Work(job)
+			untrackJob(job)
+		}(job)
+	}
+
 	return nil
 }
 
