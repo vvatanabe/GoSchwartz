@@ -1,7 +1,7 @@
 package schwartz
 
 type JobHandle struct {
-	Name     string
+	Name     DatabaseName
 	JobID    int
 	schwartz *Schwartz
 }

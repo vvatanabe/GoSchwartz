@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"time"
+	"context"
 )
 
 const (
@@ -24,6 +25,13 @@ func NewSchwartz(databases Databases) *Schwartz {
 type DatabaseName = string
 type Databases = map[DatabaseName]*sql.DB
 
+type WorkerName = string
+type Worker interface {
+	Work(job *Job) error
+	Name() string
+}
+type Workers = map[WorkerName]Worker
+
 type Schwartz struct {
 	Databases             Databases
 	Verbose               bool
@@ -37,26 +45,18 @@ type Schwartz struct {
 	funcmapCache map[string]*cache
 
 	allAbilities []interface{}
+
+	workers Workers
+
+	funcMapRepository FuncMapRepository
 }
+
+
+
 
 type cache struct {
 	funcname2id map[string]int
 	funcid2name map[int]string
-}
-
-type Job struct {
-	JobID        int
-	FuncID       int
-	FuncName     string
-	Arg          []byte
-	UniqKey      string
-	InsertTime   time.Time
-	RunAfter     time.Time
-	GrabbedUntil time.Time
-	Priority     int
-	Coalesce     string
-
-	Handle *JobHandle
 }
 
 func (s *Schwartz) isDatabaseDead(name DatabaseName) bool {
@@ -71,24 +71,25 @@ func (s *Schwartz) isDatabaseDead(name DatabaseName) bool {
 }
 
 type terms struct {
+	funcid       int
 	runAfter     *runAfterTerm
 	grabbedUntil *grabbedUntilTerm
 	jobid        *jobIDTerm
 }
 
 type runAfterTerm struct {
-	OP    string
-	Value time.Duration
+	op    string
+	value time.Duration
 }
 
 type grabbedUntilTerm struct {
-	OP    string
-	Value time.Duration
+	op    string
+	value time.Duration
 }
 
 type jobIDTerm struct {
-	OP    string
-	Value int
+	op    string
+	value int
 }
 
 func (s *Schwartz) ListJobs(
@@ -98,12 +99,69 @@ func (s *Schwartz) ListJobs(
 	coalesceOP string,
 	coalesce string,
 	wantHandle bool,
-	jobID int) []*Job {
+	jobID int,
+	limit int) []*Job {
 	var jobs []*Job
 	// TODO implements
 	var terms *terms
+	if runAfter != 0 {
+		terms.runAfter = &runAfterTerm{
+			op:    "<=",
+			value: runAfter,
+		}
+	}
+	if grabbedUntil != 0 {
+		terms.grabbedUntil = &grabbedUntilTerm{
+			op:    "<=",
+			value: grabbedUntil,
+		}
+	}
+	if jobIDTerm != 0 {
+		terms.jobid = &jobIDTerm{
+			op:    "=",
+			value: jobID,
+		}
+	}
+
+	if funcname == "" {
+		log.Fatalln("o funcname")
+	}
+
+	//limit :=
+
+	for name, db := range s.Databases {
+		if s.isDatabaseDead(name) { // TODO remove
+			continue
+		}
+
+		db.Begin()
+		tx, err := db.Begin()
+		tx.
+		var d *sql.DB
+		terms.funcid = s.funcNameToID(name, funcname)
+
+		if wantHandle {
+			h := JobHandle{}
+		}
+
+	}
+
 	return jobs
 }
+
+
+type Queryable interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	Prepare(query string) (*sql.Stmt, error)
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+
+
 
 var ErrNotFoundDB = errors.New("schwartz: Not found DB")
 
@@ -145,7 +203,11 @@ func (s *Schwartz) findDB(name DatabaseName) *sql.DB {
 func (s *Schwartz) funcIDToName(name DatabaseName, funcID int) string {
 	cache := s.funcMapCache(name)
 	return cache.funcid2name[funcID]
+}
 
+func (s *Schwartz) funcNameToID(name DatabaseName, funcname string) string {
+	cache := s.funcMapCache(name)
+	return cache.funcname2id[funcname]
 }
 
 func (s *Schwartz) funcMapCache(name DatabaseName) *cache {
@@ -160,26 +222,14 @@ func (s *Schwartz) funcMapCache(name DatabaseName) *cache {
 			// TODO error handling
 			return nil
 		}
-		stmt := `
-SELECT
-	funcid, funcname
-FROM
-	funcmap
-`
-		rows, err := db.Query(stmt)
+		fms, err := s.funcMapRepository.FindAll(db)
 		if err != nil {
-			// TODO error handling
-			return nil
+			// TODO
+			log.Fatalln(err)
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var funcid int
-			var funcname string
-			if err := rows.Scan(&funcid, &funcname); err != nil {
-				log.Fatal(err)
-			}
-			c.funcid2name[funcid] = funcname
-			c.funcname2id[funcname] = funcid
+		for _, fm := range fms {
+			c.funcid2name[fm.ID] = fm.Name
+			c.funcname2id[fm.Name] = fm.ID
 		}
 		s.funcmapCache[name] = c
 	}
@@ -238,9 +288,15 @@ func (s *Schwartz) SetStrictRemoveAbility(strictRemoveAbility bool) {
 // WORKING
 // --------------------
 
-func (s *Schwartz) CanDo(ability string) bool {
-	// TODO implements
-	return false
+func (s *Schwartz) CanDo(worker Worker) bool {
+	if worker == nil {
+		return false
+	}
+	if s.workers == nil {
+		s.workers = make(Workers)
+	}
+	s.workers[worker.Name()] = worker
+	return true
 }
 
 func (s *Schwartz) WorkOnce() error {
@@ -253,19 +309,41 @@ func (s *Schwartz) WorkUntilDone() error {
 	return nil
 }
 
-func (s *Schwartz) Work(delay *time.Duration) error {
+
+func (s *Schwartz) poll(interval time.Duration, quit <-chan bool) (<-chan *Job, error) {
+	jobs := make(chan *Job)
+
+	go func() {
+		for {
+			select {
+			case <-quit:
+				return
+			default:
+				jobs <- s.FindJobForWorkers()
+				time.Sleep(interval)
+				}
+		}
+	}()
+
+	return jobs, nil
+}
+
+func (s *Schwartz) Work(delay *time.Duration, quit <-chan bool) error {
 	if delay == nil {
 		*delay = time.Duration(5 * time.Second)
 	}
 	// TODO implements
 
-	jobs := make(chan *Job)
+	jobs, err := s.poll(*delay, quit)
+	if err != nil {
+		return err
+	}
 
 	for job := range jobs {
 		go func(job *Job) {
-			trackJob(job)
-			workers[job.FuncName].Work(job)
-			untrackJob(job)
+			s.trackJob(job)
+			s.workers[job.FuncName].Work(job)
+			s.untrackJob(job)
 		}(job)
 	}
 
