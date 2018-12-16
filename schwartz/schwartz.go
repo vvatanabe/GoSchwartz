@@ -29,11 +29,17 @@ type WorkerName = string
 type Worker interface {
 	Work(job *Job) error
 	Name() string
+	KeepExitStatusFor() time.Duration
+	MaxRetries() int
+	RetryDelay() time.Duration
+	GrabFor() time.Duration
+
 }
 type Workers = map[WorkerName]Worker
 
 type Schwartz struct {
 	Databases             Databases
+
 	Verbose               bool
 	Prioritize            int
 	Floor                 int
@@ -48,7 +54,7 @@ type Schwartz struct {
 
 	workers Workers
 
-	funcMapRepository FuncMapRepository
+	repository Repository
 }
 
 
@@ -170,26 +176,14 @@ func (s *Schwartz) LookupJob(name DatabaseName, jobID int) (*Job, error) {
 	if db == nil {
 		return nil, ErrNotFoundDB
 	}
-	stmt := `
-SELECT
-	jobid, funcid, arg, uniqkey, insert_time, run_after, grabbed_until, priority, coalesce
-FROM
-  job
-WHERE
-  jobid = ?
-`
-	var job Job
-	err := db.QueryRow(stmt, jobID).Scan(job, &job.JobID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
-		&job.RunAfter, &job.GrabbedUntil, &job.Priority, &job.Coalesce)
+	job, err := s.repository.FindJob(db, jobID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
+		// TODO
 		return nil, err
 	}
 	job.Handle = &JobHandle{name, jobID, s}
-	job.FuncName = s.funcIDToName(job.FuncID)
-	return &job, nil
+	job.FuncName = s.funcIDToName(name, job.FuncID)
+	return job, nil
 }
 
 func (s *Schwartz) findDB(name DatabaseName) *sql.DB {
@@ -222,7 +216,7 @@ func (s *Schwartz) funcMapCache(name DatabaseName) *cache {
 			// TODO error handling
 			return nil
 		}
-		fms, err := s.funcMapRepository.FindAll(db)
+		fms, err := s.repository.FindFuncMaps(db)
 		if err != nil {
 			// TODO
 			log.Fatalln(err)
