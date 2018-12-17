@@ -9,19 +9,15 @@ type Repository interface {
 	FindFuncMapByName(db *sql.DB, funcname string) (*FuncMap, error)
 	AddFuncMap(db *sql.DB, funcmap *FuncMap) error
 	FindJob(db *sql.DB, jobID int) (*Job, error)
+	AddJob(db *sql.DB, job *Job) error
 }
 
 type FuncMap struct {
-	ID   int
+	ID   int64
 	Name string
 }
 
 type RepositoryOnRDB struct {
-}
-
-func (r RepositoryOnRDB) AddFuncMap(db *sql.DB, funcmap *FuncMap) error {
-	_, err := db.Exec("")
-	return err
 }
 
 func (r RepositoryOnRDB) FindFuncMaps(db *sql.DB) ([]*FuncMap, error) {
@@ -66,6 +62,20 @@ WHERE funcname = ?
 	return &fm, nil
 }
 
+func (r RepositoryOnRDB) AddFuncMap(db *sql.DB, funcmap *FuncMap) error {
+	stmt := `INSERT INTO funcmap (funcname) VALUES (?)`
+	ret, err := db.Exec(stmt, funcmap.Name)
+	if err != nil {
+		return err
+	}
+	id, err := ret.LastInsertId()
+	if err != nil {
+		return err
+	}
+	funcmap.ID = id
+	return nil
+}
+
 func (r RepositoryOnRDB) FindJob(db *sql.DB, jobID int) (*Job, error) {
 	stmt := `
 SELECT
@@ -76,7 +86,7 @@ WHERE
   jobid = ?
 `
 	var job Job
-	err := db.QueryRow(stmt, jobID).Scan(&job.JobID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
+	err := db.QueryRow(stmt, jobID).Scan(&job.ID, &job.FuncID, &job.Arg, &job.UniqKey, &job.InsertTime,
 		&job.RunAfter, &job.GrabbedUntil, &job.Priority, &job.Coalesce)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -85,4 +95,21 @@ WHERE
 		return nil, err
 	}
 	return job, nil
+}
+
+func (r RepositoryOnRDB) AddJob(db *sql.DB, job *Job) error {
+	stmt := `
+INSERT INTO job (funcid, arg, uniqkey, insert_time, run_after, grabbed_until, priority, coalesce)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`
+	ret, err := db.Exec(stmt, job.FuncID, job.Arg, job.UniqKey, job.InsertTime, job.RunAfter, job.GrabbedUntil, job.Priority, job.Coalesce)
+	if err != nil {
+		return err
+	}
+	id, err := ret.LastInsertId()
+	if err != nil {
+		return err
+	}
+	job.ID = id
+	return nil
 }

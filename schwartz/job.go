@@ -3,7 +3,7 @@ package schwartz
 import "time"
 
 type Job struct {
-	JobID        int
+	ID           int64
 	FuncID       int
 	FuncName     string
 	Arg          []byte
@@ -18,7 +18,7 @@ type Job struct {
 }
 
 type job struct {
-	JobID        int
+	ID           int
 	FuncID       int
 	Arg          []byte
 	UniqKey      string

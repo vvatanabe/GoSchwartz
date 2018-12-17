@@ -243,8 +243,17 @@ func canDo(t interface{}) {
 // POSTING JOBS
 // --------------------
 
+
+func (s *Schwartz) innsertJobToDriver(name DatabaseName, job *Job) error {
+	job := job.FuncID = s.funcNameToID(name, funcID)
+
+}
+
 func (s *Schwartz) Insert(job *Job) error {
 	// TODO implements
+	for k, v := range s.Databases {
+
+	}
 	return nil
 }
 
