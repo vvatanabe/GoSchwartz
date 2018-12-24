@@ -8,7 +8,7 @@ type Job struct {
 	FuncName     string
 	Arg          []byte
 	UniqKey      string
-	InsertTime   time.Time
+	InsertTime   int64
 	RunAfter     time.Time
 	GrabbedUntil time.Time
 	Priority     int

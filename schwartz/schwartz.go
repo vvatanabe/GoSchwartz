@@ -6,6 +6,8 @@ import (
 	"log"
 	"time"
 	"context"
+	"math/rand"
+	"sync"
 )
 
 const (
@@ -23,25 +25,25 @@ func NewSchwartz(databases Databases) *Schwartz {
 }
 
 type DatabaseName = string
-type Databases = map[DatabaseName]*sql.DB
 
-type WorkerName = string
+type Databases = map[DatabaseName] *sql.DB
+
+type WorkName = string
+
 type Worker interface {
 	Work(job *Job) error
-	Name() string
 	KeepExitStatusFor() time.Duration
 	MaxRetries() int
 	RetryDelay() time.Duration
 	GrabFor() time.Duration
-
 }
-type Workers = map[WorkerName]Worker
+
+type Workers = map[WorkName]Worker
 
 type Schwartz struct {
-	Databases             Databases
-
+	Databases Databases
 	Verbose               bool
-	Prioritize            int
+	Prioritize            bool
 	Floor                 int
 	BatchSize             int
 	DriverCacheExpiration time.Duration
@@ -50,15 +52,10 @@ type Schwartz struct {
 
 	funcmapCache map[string]*cache
 
-	allAbilities []interface{}
-
 	workers Workers
 
 	repository Repository
 }
-
-
-
 
 type cache struct {
 	funcname2id map[string]int
@@ -204,6 +201,16 @@ func (s *Schwartz) funcNameToID(name DatabaseName, funcname string) string {
 	return cache.funcname2id[funcname]
 }
 
+func (s *Schwartz) funcNamesToIDs(name DatabaseName, funcnames []string) []int {
+	cache := s.funcMapCache(name)
+	var ids []int
+	for _, name := range funcnames {
+		id := cache.funcname2id[name]
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (s *Schwartz) funcMapCache(name DatabaseName) *cache {
 	c, ok := s.funcmapCache[name]
 	if !ok {
@@ -245,7 +252,10 @@ func canDo(t interface{}) {
 
 
 func (s *Schwartz) innsertJobToDriver(name DatabaseName, job *Job) error {
-	job := job.FuncID = s.funcNameToID(name, funcID)
+	job.FuncID = s.funcNameToID(name, job.FuncName)
+	job.InsertTime = time.Now().Unix()
+
+	s.repository.AddJob(s.Databases[name], job)
 
 }
 
@@ -322,7 +332,7 @@ func (s *Schwartz) poll(interval time.Duration, quit <-chan bool) (<-chan *Job, 
 			case <-quit:
 				return
 			default:
-				jobs <- s.FindJobForWorkers()
+				jobs <- s.FindJobsForWorkers(s.workers)
 				time.Sleep(interval)
 				}
 		}
@@ -345,8 +355,12 @@ func (s *Schwartz) Work(delay *time.Duration, quit <-chan bool) error {
 	for job := range jobs {
 		go func(job *Job) {
 			s.trackJob(job)
-			s.workers[job.FuncName].Work(job)
-			s.untrackJob(job)
+			defer s.untrackJob(job)
+			if err := s.workers[job.FuncName].Work(job); err != nil {
+				s.Failed(job)
+				return
+			}
+			s.Completed(job)
 		}(job)
 	}
 
@@ -363,9 +377,76 @@ func (s *Schwartz) GrabAndWorkOn(handle string) error {
 	return nil
 }
 
-func (s *Schwartz) FindJobForWorkers(abilities []string) *Job {
+func (s *Schwartz) FindJobsForWorkers(workers []string) []*Job {
 	// TODO implements
-	return nil
+
+	type option struct {
+
+	}
+
+
+	if s.Prioritize {
+
+	} else {
+
+	}
+
+	var grabbedJobs []*Job
+	for dbName, db := range s.Databases {
+
+		if s.isDatabaseDead(dbName) {
+			continue
+		}
+
+		ids := s.funcNamesToIDs(dbName, workers)
+
+		// SELECT *
+		// FROM job
+		// WHERE funcid=? AND run_after<=? AND grabbed_until<=? AND priority>=?
+		// ORDER BY priority desc, jobid
+		type terms struct {
+			funcids []int
+			runAfter time.Time
+			grabbedUntil time.Time
+			priority int
+		}
+
+		t := terms{
+			funcids: ids,
+			runAfter: now,
+			grabbedUntil: now,
+		}
+
+		if s.Floor > 0 {
+			t.priority = s.Floor
+		}
+
+		jobs, err := s.repository.FindJobsByFuncIDsOrderByJobID(db, ids)
+		if err != nil {
+			// TODO error handling
+			continue
+		}
+
+		grabbedJobs = append(grabbedJobs, s.graJobs(jobs))
+	}
+
+	return grabbedJobs
+}
+
+func (s *Schwartz) graJobs(db *sql.DB, jobs []*Job) []*Job {
+	shuffle(jobs)
+
+	var grabbedJobs []*Job
+	for _, job := range jobs {
+		job.FuncName = s.funcIDToName(db, job.FuncID)
+		oldGrabbedUntill := job.GrabbedUntil
+
+		if err := s.repository.UpdateJob(db, job, oldGrabbedUntill); err != nil {
+			continue
+		}
+		grabbedJobs = append(grabbedJobs, job)
+	}
+	return grabbedJobs
 }
 
 func (s *Schwartz) FindJobWithCoalescingValue(ability string, coval interface{}) *Job {
@@ -373,12 +454,15 @@ func (s *Schwartz) FindJobWithCoalescingValue(ability string, coval interface{})
 	return nil
 }
 
-func (s *Schwartz) FindJobwithCoalescingPrefix(ability string, coval interface{}) *Job {
+func (s *Schwartz) FindJobWithCoalescingPrefix(ability string, coval interface{}) *Job {
 	// TODO implements
 	return nil
 }
 
-func (s *Schwartz) GetServerTime(driver string) time.Time {
-	// TODO implements
-	return time.Now()
+func shuffle(jobs []*Job) {
+	n := len(jobs)
+	for i := n - 1; i >= 0; i-- {
+		j := rand.Intn(i + 1)
+		jobs[i], jobs[j] = jobs[j], jobs[i]
+	}
 }

@@ -14,6 +14,10 @@ import (
 	"github.com/vvatanabe/GoSchwartz/schwartz"
 )
 
+func main2() {
+
+}
+
 func main() {
 
 	s := schwartz.Schwartz{}
