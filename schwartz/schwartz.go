@@ -8,6 +8,8 @@ import (
 	"context"
 	"math/rand"
 	"sync"
+	"net"
+	"sync/atomic"
 )
 
 const (
@@ -17,7 +19,9 @@ const (
 
 func NewSchwartz(databases Databases) *Schwartz {
 	var schwartz *Schwartz
-	schwartz.Databases = databases
+	for k, v := range databases {
+		schwartz.databases[k] = &DB{DB: v}
+	}
 	schwartz.RetrySeconds = RetryDefault
 	schwartz.BatchSize = FindJobBatchSize
 	// TODO implements
@@ -27,6 +31,7 @@ func NewSchwartz(databases Databases) *Schwartz {
 type DatabaseName = string
 
 type Databases = map[DatabaseName] *sql.DB
+type databases = map[DatabaseName] *DB
 
 type WorkName = string
 
@@ -41,7 +46,7 @@ type Worker interface {
 type Workers = map[WorkName]Worker
 
 type Schwartz struct {
-	Databases Databases
+
 	Verbose               bool
 	Prioritize            bool
 	Floor                 int
@@ -50,28 +55,98 @@ type Schwartz struct {
 	RetrySeconds          time.Duration
 	StrictRemoveAbility   bool
 
+	databases databases
 	funcmapCache map[string]*cache
 
 	workers Workers
 
 	repository Repository
+
+
+	inShutdown        int32 // 0 or 1. accessed atomically (non-zero means we're in Shutdown)
+	mu                sync.Mutex
+	activeJob        map[*Job]struct{}
+	activeJobWg      sync.WaitGroup
+	doneChan          chan struct{}
+	onShutdown        []func()
 }
 
-type cache struct {
-	funcname2id map[string]int
-	funcid2name map[int]string
+func (s *Schwartz) shuttingDown() bool {
+	return atomic.LoadInt32(&s.inShutdown) != 0
 }
 
-func (s *Schwartz) isDatabaseDead(name DatabaseName) bool {
-	db, ok := s.Databases[name]
-	if !ok {
-		return false
+func (s *Schwartz) trackJob(job *Job, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeJob == nil {
+		s.activeJob = make(map[*Job]struct{})
 	}
-	if err := db.Ping(); err != nil {
-		return true
+	if add {
+		s.activeJob[job] = struct{}{}
+		s.activeJobWg.Add(1)
+	} else {
+		delete(s.activeJob, job)
+		s.activeJobWg.Done()
 	}
-	return false
 }
+
+func (s *Schwartz) getDoneChan() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getDoneChanLocked()
+}
+
+func (s *Schwartz) getDoneChanLocked() chan struct{} {
+	if s.doneChan == nil {
+		s.doneChan = make(chan struct{})
+	}
+	return s.doneChan
+}
+
+func (s *Schwartz) closeDoneChanLocked() {
+	ch := s.getDoneChanLocked()
+	select {
+	case <-ch:
+		// Already closed. Don't close again.
+	default:
+		// Safe to close here. We're the only closer, guarded
+		// by s.mu.
+		close(ch)
+	}
+}
+
+func (s *Schwartz) RegisterOnShutdown(f func()) {
+	s.mu.Lock()
+	s.onShutdown = append(s.onShutdown, f)
+	s.mu.Unlock()
+}
+
+func (s *Schwartz) Shutdown(ctx context.Context) error {
+	atomic.StoreInt32(&s.inShutdown, 1)
+
+	s.mu.Lock()
+	s.closeDoneChanLocked()
+	for _, f := range s.onShutdown {
+		go f()
+	}
+	s.mu.Unlock()
+
+	finished := make(chan struct{}, 1)
+	go func() {
+		s.activeJobWg.Wait()
+		finished <- struct{}{}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-finished:
+		return nil
+	}
+}
+
+
+
 
 type terms struct {
 	funcid       int
@@ -152,20 +227,6 @@ func (s *Schwartz) ListJobs(
 	return jobs
 }
 
-
-type Queryable interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	Prepare(query string) (*sql.Stmt, error)
-	Query(query string, args ...interface{}) (*sql.Rows, error)
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRow(query string, args ...interface{}) *sql.Row
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-}
-
-
-
-
 var ErrNotFoundDB = errors.New("schwartz: Not found DB")
 
 func (s *Schwartz) LookupJob(name DatabaseName, jobID int) (*Job, error) {
@@ -196,7 +257,7 @@ func (s *Schwartz) funcIDToName(name DatabaseName, funcID int) string {
 	return cache.funcid2name[funcID]
 }
 
-func (s *Schwartz) funcNameToID(name DatabaseName, funcname string) string {
+func (s *Schwartz) funcNameToID(name DatabaseName, funcname string) int {
 	cache := s.funcMapCache(name)
 	return cache.funcname2id[funcname]
 }
@@ -251,29 +312,67 @@ func canDo(t interface{}) {
 // --------------------
 
 
-func (s *Schwartz) innsertJobToDriver(name DatabaseName, job *Job) error {
+func (s *Schwartz) insertJobToDriver(name DatabaseName, job *Job) error {
 	job.FuncID = s.funcNameToID(name, job.FuncName)
-	job.InsertTime = time.Now().Unix()
+	currentTime, err := s.repository.GetServerTime(s.Databases[name])
+	if err != nil {
+		// TODO
+		return err
+	}
+	job.InsertTime = currentTime.Unix()
+	err = s.repository.AddJob(s.Databases[name], job)
+	if err != nil {
+		// TODO
+		return err
+	}
+	if job.ID > 0 {
 
-	s.repository.AddJob(s.Databases[name], job)
-
+	}
 }
 
 func (s *Schwartz) Insert(job *Job) error {
 	// TODO implements
-	for k, v := range s.Databases {
-
+	for dbName, db := range s.Databases {
+		if s.isDatabaseDead(dbName) {
+			// TODO
+			continue
+		}
+		s.insertJobToDriver(dbName, job)
+		return nil
 	}
-	return nil
+	return errors.New("can not insert")
 }
 
-func (s *Schwartz) InsertFuncNameWithArgs(funcname string, args ...string) error {
+func (s *Schwartz) InsertFuncNameWithArgs(funcname string, arg []byte) error {
 	// TODO implements
+	var job Job
+	job.FuncName = funcname
+	job.Arg = arg
+	job.
 	return nil
 }
 
 func (s *Schwartz) InsertJobs(jobs []*Job) error {
 	// TODO implements
+	for dbName, db := range s.Databases {
+		if s.isDatabaseDead(dbName) {
+			// TODO
+			continue
+		}
+
+		err := WithTransaction(db, func(tx Transaction) error {
+			for _, job := range jobs {
+				err := s.insertJobToDriver(dbName, job)
+				if err != nil {
+					return err
+				}
+			}
+		})
+		if err != nil {
+			// TODO
+		}
+
+	}
 	return nil
 }
 
@@ -323,44 +422,30 @@ func (s *Schwartz) WorkUntilDone() error {
 }
 
 
-func (s *Schwartz) poll(interval time.Duration, quit <-chan bool) (<-chan *Job, error) {
-	jobs := make(chan *Job)
-
-	go func() {
-		for {
-			select {
-			case <-quit:
-				return
-			default:
-				jobs <- s.FindJobsForWorkers(s.workers)
-				time.Sleep(interval)
-				}
-		}
-	}()
-
-	return jobs, nil
-}
-
 func (s *Schwartz) Work(delay *time.Duration, quit <-chan bool) error {
 	if delay == nil {
 		*delay = time.Duration(5 * time.Second)
 	}
-	// TODO implements
+
+	JobFinder{}
 
 	jobs, err := s.poll(*delay, quit)
 	if err != nil {
 		return err
 	}
-
 	for job := range jobs {
 		go func(job *Job) {
-			s.trackJob(job)
-			defer s.untrackJob(job)
+			s.trackJob(job, true)
+			defer s.trackJob(job, false)
 			if err := s.workers[job.FuncName].Work(job); err != nil {
-				s.Failed(job)
+				if err := job.Failed(); err != nil {
+					// TODO
+				}
 				return
 			}
-			s.Completed(job)
+			if err := job.Completed(); err != nil {
+				// TODO
+			}
 		}(job)
 	}
 
@@ -379,69 +464,29 @@ func (s *Schwartz) GrabAndWorkOn(handle string) error {
 
 func (s *Schwartz) FindJobsForWorkers(workers []string) []*Job {
 	// TODO implements
-
-	type option struct {
-
-	}
-
-
-	if s.Prioritize {
-
-	} else {
-
-	}
-
 	var grabbedJobs []*Job
 	for dbName, db := range s.Databases {
-
 		if s.isDatabaseDead(dbName) {
 			continue
 		}
-
 		ids := s.funcNamesToIDs(dbName, workers)
-
-		// SELECT *
-		// FROM job
-		// WHERE funcid=? AND run_after<=? AND grabbed_until<=? AND priority>=?
-		// ORDER BY priority desc, jobid
-		type terms struct {
-			funcids []int
-			runAfter time.Time
-			grabbedUntil time.Time
-			priority int
-		}
-
-		t := terms{
-			funcids: ids,
-			runAfter: now,
-			grabbedUntil: now,
-		}
-
-		if s.Floor > 0 {
-			t.priority = s.Floor
-		}
-
-		jobs, err := s.repository.FindJobsByFuncIDsOrderByJobID(db, ids)
+		jobs, err := s.repository.FindJobsByFuncIDsOrderByJobID(db, ids, Floor(s.Floor), Prioritize(s.Prioritize))
 		if err != nil {
 			// TODO error handling
 			continue
 		}
-
-		grabbedJobs = append(grabbedJobs, s.graJobs(jobs))
+		grabbedJobs = append(grabbedJobs, s.graJobs(db, jobs))
 	}
-
 	return grabbedJobs
 }
 
 func (s *Schwartz) graJobs(db *sql.DB, jobs []*Job) []*Job {
 	shuffle(jobs)
-
 	var grabbedJobs []*Job
 	for _, job := range jobs {
 		job.FuncName = s.funcIDToName(db, job.FuncID)
-		oldGrabbedUntill := job.GrabbedUntil
-
-		if err := s.repository.UpdateJob(db, job, oldGrabbedUntill); err != nil {
+		oldGrabbedUntil := job.GrabbedUntil
+		if err := s.repository.UpdateJob(db, job, oldGrabbedUntil); err != nil {
 			continue
 		}
 		grabbedJobs = append(grabbedJobs, job)

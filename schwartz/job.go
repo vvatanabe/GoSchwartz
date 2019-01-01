@@ -1,6 +1,21 @@
 package schwartz
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+type job struct {
+	ID           int
+	FuncID       int
+	Arg          []byte
+	UniqKey      string
+	InsertTime   time.Time
+	RunAfter     time.Time
+	GrabbedUntil time.Time
+	Priority     int
+	Coalesce     string
+}
 
 type Job struct {
 	ID           int64
@@ -14,17 +29,35 @@ type Job struct {
 	Priority     int
 	Coalesce     string
 
-	Handle *JobHandle
+	failures []*FailureLog
+
+	finished   bool
+	exitStatus int
+	handler    *JobHandle
 }
 
-type job struct {
-	ID           int
-	FuncID       int
-	Arg          []byte
-	UniqKey      string
-	InsertTime   time.Time
-	RunAfter     time.Time
-	GrabbedUntil time.Time
-	Priority     int
-	Coalesce     string
+func (j *Job) FailuresSize() int {
+	return len(j.failures)
+}
+
+func (j *Job) Completed() error {
+	if j.finished {
+		return errors.New("already finished")
+	}
+	err := j.handler.Remove(j.ID)
+	if err != nil {
+		return err
+	}
+	j.finished = true
+}
+
+func (j *Job) Failed() error {
+	if j.finished {
+		return errors.New("already finished")
+	}
+	err := j.handler.Remove(j.ID)
+	if err != nil {
+		return err
+	}
+	j.finished = true
 }

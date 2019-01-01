@@ -47,9 +47,23 @@ func main() {
 
 }
 
+//type Worker interface {
+//	Work(job *Job) error
+//	KeepExitStatusFor() time.Duration
+//	MaxRetries() int
+//	RetryDelay() time.Duration
+//	GrabFor() time.Duration
+//  BackoffStrategy() int
+//}
+
 type HelloWorker struct {
+	s *schwartz.Schwartz
 }
 
 func (w HelloWorker) Work(job schwartz.Job) {
 
+}
+
+func (w HelloWorker) RetryDelay() time.Duration {
+	return 5 * time.Second * job.RetryCnt
 }
