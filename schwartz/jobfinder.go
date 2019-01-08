@@ -94,7 +94,7 @@ func (f *finder) getFuncMapCache(name DatabaseName) *cache {
 			c.funcid2name[fm.ID] = fm.Name
 			c.funcname2id[fm.Name] = fm.ID
 		}
-		f.FuncmapCache[name] = c
+		f.funcMapCache[name] = c
 	}
 	return c
 }
