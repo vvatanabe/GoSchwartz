@@ -61,3 +61,7 @@ func (j *Job) Failed() error {
 	}
 	j.finished = true
 }
+
+// test4
+// test5
+// test6
